@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  spotify-to-tidal:
+    build: .
+    image: yourusername/spotify-to-tidal:latest  # Replace 'yourusername' with your Docker Hub username
+    container_name: spotify-to-tidal-sync
+    environment:
+      # Cron schedule - default is daily at 2 AM
+      # Format: minute hour day_of_month month day_of_week
+      # Examples:
+      # "0 2 * * *"     - Daily at 2 AM
+      # "0 */6 * * *"   - Every 6 hours
+      # "0 8,20 * * *"  - Twice daily at 8 AM and 8 PM
+      # "0 2 * * 0"     - Weekly on Sunday at 2 AM
+      CRON_SCHEDULE: "*/2 * * * *"
+      
+      # Enable Dolby Atmos track preference
+      # Set to "true" to prefer Dolby Atmos tracks when available
+      ENABLE_ATMOS: "true"
+    volumes:
+      # Mount the entire project directory to persist config, cache, and other files
+      - .:/config
+      # Optional: Mount logs directory to persist logs
+      - ./logs:/var/log/spotify-to-tidal
+    restart: unless-stopped
+    # Uncomment the following lines if you need to set timezone
+    # environment:
+    #   - TZ=America/New_York 
