@@ -10,10 +10,17 @@ def main():
     parser.add_argument('--config', default='config.yml', help='location of the config file')
     parser.add_argument('--uri', help='synchronize a specific URI instead of the one in the config')
     parser.add_argument('--sync-favorites', action=argparse.BooleanOptionalAction, help='synchronize the favorites')
+    parser.add_argument('--debug', action='store_true', help='enable detailed debug logging for track searches')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Configure debug logging if requested
+    if args.debug:
+        print("🔍 Debug logging enabled - detailed track search logs will be written to track_search_debug.log")
+        _sync.configure_debug_logging(True)
+    
     print("Opening Spotify session")
     spotify_session = _auth.open_spotify_session(config['spotify'])
     print("Opening Tidal session")

@@ -2,6 +2,8 @@
 
 import asyncio
 from .cache import failure_cache, track_match_cache
+import contextvars
+from collections import defaultdict
 import datetime
 from difflib import SequenceMatcher
 from functools import partial
@@ -10,6 +12,7 @@ import math
 import requests
 import sys
 import spotipy
+import threading
 import tidalapi
 from .tidalapi_patch import add_multiple_tracks_to_playlist, clear_tidal_playlist, get_all_favorites, get_all_playlists, get_all_playlist_tracks
 import time
@@ -20,6 +23,54 @@ import unicodedata
 import math
 
 from .type import spotify as t_spotify
+
+# Context variable to store track ID for current task
+current_track_id: contextvars.ContextVar[str] = contextvars.ContextVar('current_track_id')
+
+# Module-level debug configuration
+_DEBUG_LOGGING_ENABLED = False
+
+def configure_debug_logging(enabled: bool):
+    """Configure whether debug logging is enabled"""
+    global _DEBUG_LOGGING_ENABLED
+    _DEBUG_LOGGING_ENABLED = enabled
+
+def is_debug_logging_enabled() -> bool:
+    """Check if debug logging is currently enabled"""
+    return _DEBUG_LOGGING_ENABLED
+
+class TrackSearchLogger:
+    def __init__(self, log_file_path):
+        self._logs = defaultdict(list)  # track_id -> [log_entries]
+        self._lock = threading.Lock()
+        self._log_file = log_file_path
+    
+    def log(self, message, level='DEBUG'):
+        # Only log if debug mode is enabled
+        if not is_debug_logging_enabled():
+            return
+            
+        # Get track ID from context (set at task level)
+        track_id = current_track_id.get(None)
+        if track_id:
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            with self._lock:
+                self._logs[track_id].append(f"[{timestamp}] {level}: {message}")
+    
+    def write_all_logs(self):
+        # Only write logs if debug mode is enabled and we have logs
+        if not is_debug_logging_enabled() or not self._logs:
+            return
+            
+        # Write all collected logs grouped by track
+        with open(self._log_file, 'a', encoding='utf-8') as f:
+            for track_id, logs in self._logs.items():
+                f.write(f"\n{'='*60}\n")
+                f.write(f"TRACK: {track_id}\n")
+                f.write(f"{'='*60}\n")
+                for log_entry in logs:
+                    f.write(f"{log_entry}\n")
+                f.write(f"{'='*60}\n\n")
 
 def normalize(s) -> str:
     return unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode('ascii')
@@ -87,51 +138,104 @@ def artist_match(tidal: tidalapi.Track | tidalapi.Album, spotify) -> bool:
         return True
     return get_tidal_artists(tidal, True).intersection(get_spotify_artists(spotify, True)) != set()
 
-def match(tidal_track, spotify_track) -> bool:
-    if not spotify_track['id']: return False
-    return isrc_match(tidal_track, spotify_track) or (
-        duration_match(tidal_track, spotify_track)
-        and name_match(tidal_track, spotify_track)
-        and artist_match(tidal_track, spotify_track)
-    )
+def match(tidal_track, spotify_track, logger=None) -> bool:
+    if not spotify_track['id']: 
+        logger.log("No Spotify track ID - skipping match")
+        return False
+    
+    # Check ISRC match first (most reliable)
+    if isrc_match(tidal_track, spotify_track):
+        logger.log(f"✓ ISRC MATCH: {tidal_track.name} by {', '.join([a.name for a in tidal_track.artists])}")
+        return True
+    else:
+        logger.log(f"✗ ISRC no match: Tidal ISRC={getattr(tidal_track, 'isrc', 'None')}, Spotify ISRC={spotify_track.get('external_ids', {}).get('isrc', 'None')}")
+    
+    # Check combined criteria
+    duration_ok = duration_match(tidal_track, spotify_track)
+    name_ok = name_match(tidal_track, spotify_track)
+    artist_ok = artist_match(tidal_track, spotify_track)
+    
+    logger.log(f"Duration match: {'✓' if duration_ok else '✗'} (Tidal: {tidal_track.duration}s, Spotify: {spotify_track['duration_ms']/1000}s)")
+    logger.log(f"Name match: {'✓' if name_ok else '✗'} (Tidal: '{tidal_track.name}', Spotify: '{spotify_track['name']}')")
+    logger.log(f"Artist match: {'✓' if artist_ok else '✗'} (Tidal: {', '.join([a.name for a in tidal_track.artists])}, Spotify: {', '.join([a['name'] for a in spotify_track['artists']])})")
+    
+    if duration_ok and name_ok and artist_ok:
+        logger.log(f"✓ COMBINED MATCH: {tidal_track.name} by {', '.join([a.name for a in tidal_track.artists])}")
+        return True
+    else:
+        logger.log(f"✗ Combined criteria failed")
+        return False
 
-def test_album_similarity(spotify_album, tidal_album, threshold=0.6):
-    return SequenceMatcher(None, simple(spotify_album['name']), simple(tidal_album.name)).ratio() >= threshold and artist_match(tidal_album, spotify_album)
+def test_album_similarity(spotify_album, tidal_album, threshold=0.6, logger=None):
+    name_ratio = SequenceMatcher(None, simple(spotify_album['name']), simple(tidal_album.name)).ratio()
+    artist_match_result = artist_match(tidal_album, spotify_album)
+    result = name_ratio >= threshold and artist_match_result
+    
+    logger.log(f"📀 Album similarity: name_ratio={name_ratio:.3f} (threshold={threshold}), artist_match={artist_match_result} → {'✓' if result else '✗'}")
+    
+    return result
 
-async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Session) -> tidalapi.Track | None:
+async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Session, logger=None) -> tidalapi.Track | None:
+    artists = ', '.join([a['name'] for a in spotify_track['artists']])
+    logger.log(f"🔍 Starting search for: '{spotify_track['name']}' by {artists}")
+    
     def _search_for_track_in_album():
         # search for album name and first album artist
         if 'album' in spotify_track and 'artists' in spotify_track['album'] and len(spotify_track['album']['artists']):
             query = simple(spotify_track['album']['name']) + " " + simple(spotify_track['album']['artists'][0]['name'])
+            logger.log(f"📀 Album search query: '{query}'")
+            
             album_result = tidal_session.search(query, models=[tidalapi.album.Album])
-            for album in album_result['albums']:
-                if album.num_tracks >= spotify_track['track_number'] and test_album_similarity(spotify_track['album'], album):
-                    album_tracks = album.tracks()
-                    if len(album_tracks) < spotify_track['track_number']:
-                        assert( not len(album_tracks) == album.num_tracks ) # incorrect metadata :(
-                        continue
-                    track = album_tracks[spotify_track['track_number'] - 1]
-                    if match(track, spotify_track):
-                        failure_cache.remove_match_failure(spotify_track['id'])
-                        return track
+            album_count = len(album_result['albums'])
+            logger.log(f"📀 Found {album_count} albums")
+            
+            for i, album in enumerate(album_result['albums']):
+                  logger.log(f"📀 Checking album {i+1}/{album_count}: '{album.name}' by {', '.join([a.name for a in album.artists])}")
+                  
+                  if album.num_tracks >= spotify_track['track_number'] and test_album_similarity(spotify_track['album'], album, logger=logger):
+                      logger.log(f"📀 Album similarity passed, getting tracks (track #{spotify_track['track_number']})")
+                      album_tracks = album.tracks()
+                      if len(album_tracks) < spotify_track['track_number']:
+                          logger.log(f"📀 Album has insufficient tracks ({len(album_tracks)} < {spotify_track['track_number']})")
+                          assert( not len(album_tracks) == album.num_tracks ) # incorrect metadata :(
+                          continue
+                      track = album_tracks[spotify_track['track_number'] - 1]
+                      logger.log(f"📀 Testing track from album: '{track.name}' by {', '.join([a.name for a in track.artists])}")
+                      if match(track, spotify_track, logger):
+                          failure_cache.remove_match_failure(spotify_track['id'])
+                          return track
+                  else:
+                      logger.log(f"📀 Album similarity failed or insufficient tracks")
 
     def _search_for_standalone_track():
         # if album search fails then search for track name and first artist
         query = simple(spotify_track['name']) + ' ' + simple(spotify_track['artists'][0]['name'])
-        for track in tidal_session.search(query, models=[tidalapi.media.Track])['tracks']:
-            if match(track, spotify_track):
+        logger.log(f"🎵 Standalone search query: '{query}'")
+        
+        track_result = tidal_session.search(query, models=[tidalapi.media.Track])
+        track_count = len(track_result['tracks'])
+        logger.log(f"🎵 Found {track_count} tracks")
+        
+        for i, track in enumerate(track_result['tracks']):
+            logger.log(f"🎵 Testing track {i+1}/{track_count}: '{track.name}' by {', '.join([a.name for a in track.artists])}")
+            if match(track, spotify_track, logger):
                 failure_cache.remove_match_failure(spotify_track['id'])
                 return track
+    
     await rate_limiter.acquire()
     album_search = await asyncio.to_thread( _search_for_track_in_album )
     if album_search:
+        logger.log(f"🎉 Found via album search: '{album_search.name}'")
         return album_search
+    
     await rate_limiter.acquire()
     track_search = await asyncio.to_thread( _search_for_standalone_track )
     if track_search:
+        logger.log(f"🎉 Found via standalone search: '{track_search.name}'")
         return track_search
 
     # if none of the search modes succeeded then store the track id to the failure cache
+    logger.log("❌ No match found - adding to failure cache")
     failure_cache.cache_match_failure(spotify_track['id'])
 
 async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
@@ -264,12 +368,35 @@ async def search_new_tracks_on_tidal(tidal_session: tidalapi.Session, spotify_tr
     if not tracks_to_search:
         return
 
+    # Set up debug logging (always create logger, but it will be no-op if debug disabled)
+    logger = TrackSearchLogger("track_search_debug.log")
+
+    # Wrapper function to set context for each track search
+    async def search_with_context(spotify_track):
+        current_track_id.set(spotify_track['id'])
+        artist_names = ', '.join([a['name'] for a in spotify_track['artists']])
+        logger.log(f"🚀 STARTING TRACK SEARCH: '{spotify_track['name']}' by {artist_names}", 'INFO')
+        
+        try:
+            result = await repeat_on_request_error(tidal_search, spotify_track, semaphore, tidal_session, logger)
+            if result:
+                logger.log(f"✅ TRACK SEARCH COMPLETED - FOUND: '{result.name}' by {', '.join([a.name for a in result.artists])}", 'SUCCESS')
+            else:
+                logger.log(f"❌ TRACK SEARCH COMPLETED - NOT FOUND", 'WARNING')
+            return result
+        except Exception as e:
+            logger.log(f"💥 TRACK SEARCH FAILED WITH EXCEPTION: {str(e)}", 'ERROR')
+            raise
+
     # Search for each of the tracks on Tidal concurrently
     task_description = "Searching Tidal for {}/{} tracks in Spotify playlist '{}'".format(len(tracks_to_search), len(spotify_tracks), playlist_name)
     semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
     rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
-    search_results = await atqdm.gather( *[ repeat_on_request_error(tidal_search, t, semaphore, tidal_session) for t in tracks_to_search ], desc=task_description )
+    search_results = await atqdm.gather( *[ search_with_context(t) for t in tracks_to_search ], desc=task_description )
     rate_limiter_task.cancel()
+
+    # Write all debug logs to file
+    logger.write_all_logs()
 
     # Add the search results to the cache
     song404 = []
@@ -413,4 +540,6 @@ def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: t
             raise e
         output.append((spotify_playlist, tidal_playlist))
     return output
+
+
 
