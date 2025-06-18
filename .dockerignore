@@ -1,0 +1,60 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+build
+develop-eggs
+dist
+downloads
+eggs
+.eggs
+lib
+lib64
+parts
+sdist
+var
+wheels
+*.egg-info
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv
+env
+.venv
+.env
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+.pytest_cache
+.coverage
+htmlcov
+
+# Logs
+*.log
+
+# Config files (will be mounted)
+config.yml
+example_config.yml
+
+# Documentation
+*.md
+LICENSE
+
+# Other
+songs not found.txt 
